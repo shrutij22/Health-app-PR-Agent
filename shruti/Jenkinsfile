@@ -1,0 +1,203 @@
+pipeline {
+    agent { label 'jenkins_slave_180_214' }
+
+    environment {
+        SCORE_THRESHOLD = '6'
+        GROQ_API_KEY    = credentials('openai-api-key')
+        BITBUCKET_TOKEN = credentials('bitbucket-token')
+    }
+
+    tools {
+        maven 'M3'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "Checking out: ${env.BRANCH_NAME}"
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Building...'
+                sh 'mvn clean compile -q'
+            }
+        }
+
+        stage('PR Agent Review') {
+            when {
+                changeRequest()
+            }
+            steps {
+                script {
+
+                    def groqKey      = env.GROQ_API_KEY
+                    def bitbucketTok = env.BITBUCKET_TOKEN
+
+                    def prUrl = "https://bitbucket.quickheal.com/bitbucket/projects/TRAIN/repos/shruti/pull-requests/${env.CHANGE_ID}"
+
+                    echo "======================================"
+                    echo "PR Agent Review for PR #${env.CHANGE_ID}"
+                    echo "======================================"
+
+                    // Step 1: Install PR Agent
+                    sh '''
+                        python3.12 -m pip install git+https://github.com/Codium-ai/pr-agent.git --user --ignore-requires-python -q
+                    '''
+
+                    // Step 2: Run real PR Agent /review
+                    def reviewOutput = sh(
+                        script: """
+                            export PATH=/root/.local/bin:\$PATH
+                            export CONFIG__GIT_PROVIDER=bitbucket_server
+                            export BITBUCKET_SERVER__URL=https://bitbucket.quickheal.com/bitbucket
+                            export BITBUCKET_SERVER__BEARER_TOKEN=${bitbucketTok}
+                            export OPENAI__KEY=${groqKey}
+                            export GROQ_API_KEY=${groqKey}
+                            export OPENAI__API_BASE=https://api.groq.com/openai/v1
+                            export OPENAI__API_TYPE=openai
+                            export CONFIG__MODEL=groq/llama-3.3-70b-versatile
+                            export CONFIG__CUSTOM_MODEL_MAX_TOKENS=32000
+                            export CONFIG__PUBLISH_OUTPUT=true
+                            python3.12 -m pr_agent.cli --pr_url=${prUrl} review 2>&1
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    echo "======================================"
+                    echo "PR Agent Review Output:"
+                    echo "${reviewOutput}"
+                    echo "======================================"
+
+                    // Step 3: Run /improve
+                    sh """
+                        export PATH=/root/.local/bin:\$PATH
+                        export CONFIG__GIT_PROVIDER=bitbucket_server
+                        export BITBUCKET_SERVER__URL=https://bitbucket.quickheal.com/bitbucket
+                        export BITBUCKET_SERVER__BEARER_TOKEN=${bitbucketTok}
+                        export OPENAI__KEY=${groqKey}
+                        export GROQ_API_KEY=${groqKey}
+                        export OPENAI__API_BASE=https://api.groq.com/openai/v1
+                        export OPENAI__API_TYPE=openai
+                        export CONFIG__MODEL=groq/llama-3.3-70b-versatile
+                        export CONFIG__CUSTOM_MODEL_MAX_TOKENS=32000
+                        export CONFIG__PUBLISH_OUTPUT=true
+                        python3.12 -m pr_agent.cli --pr_url=${prUrl} improve 2>&1
+                    """
+
+                    // Step 4: Get LATEST PR Agent comment from Bitbucket API
+                    sh '''
+cat > /tmp/get_comments.py << 'PYEOF'
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    comments = []
+    for item in data.get('values', []):
+        if item.get('action') == 'COMMENTED':
+            text = item.get('comment', {}).get('text', '')
+            comments.append(text)
+    print(comments[-1] if comments else '')
+except:
+    print('')
+PYEOF
+'''
+
+                    def prComments = sh(
+                        script: """
+                            curl -s -H "Authorization: Bearer ${bitbucketTok}" \
+                            "https://bitbucket.quickheal.com/bitbucket/rest/api/1.0/projects/TRAIN/repos/shruti/pull-requests/${env.CHANGE_ID}/activities?limit=5" \
+                            | python3.12 /tmp/get_comments.py
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Latest PR Comment: ${prComments}"
+
+                    // Step 5: Extract score from latest comment only
+                    def score = 0
+                    def combinedOutput = reviewOutput + "\n" + prComments
+
+                    def scoreLine = combinedOutput.readLines().find {
+                        it.toLowerCase().contains('score')
+                    }
+
+                    if (scoreLine) {
+                        def matcher = (scoreLine =~ /(\d+)/)
+                        if (matcher) {
+                            score = matcher[0][1].toInteger()
+                            echo "Extracted Score: ${score}/10"
+                        }
+                    } else {
+                        def highCount = combinedOutput.count('possible issue') +
+                                        combinedOutput.count('importance: 9') +
+                                        combinedOutput.count('importance: 8') +
+                                        combinedOutput.count('Needs Work') +
+                                        combinedOutput.count('NullPointer') +
+                                        combinedOutput.count('High') +
+                                        combinedOutput.count('HIGH') +
+                                        combinedOutput.count('Critical')
+
+                        def medCount  = combinedOutput.count('importance: 7') +
+                                        combinedOutput.count('importance: 6') +
+                                        combinedOutput.count('importance: 5') +
+                                        combinedOutput.count('Medium') +
+                                        combinedOutput.count('MEDIUM')
+
+                        echo "Issues found → High: ${highCount}  Medium: ${medCount}"
+
+                        if      (highCount == 0 && medCount == 0) score = 8
+                        else if (highCount == 0 && medCount <= 2) score = 7
+                        else if (highCount <= 2)                  score = 5
+                        else if (highCount <= 4)                  score = 3
+                        else                                      score = 2
+
+                        echo "Calculated Score: ${score}/10"
+                    }
+
+                    // Step 6: Print final verdict
+                    echo "======================================"
+                    echo "  SCORE     : ${score}/10"
+                    echo "  THRESHOLD : ${SCORE_THRESHOLD}/10"
+                    echo "  RESULT    : ${score >= SCORE_THRESHOLD.toInteger() ? 'PASSED' : 'FAILED'}"
+                    echo "======================================"
+
+                    // Step 7: PASS or FAIL pipeline
+                    if (score < SCORE_THRESHOLD.toInteger()) {
+                        error("""
+======================================
+PR AGENT REVIEW  : FAILED
+Score            : ${score}/10
+Threshold        : ${SCORE_THRESHOLD}/10
+--------------------------------------
+Fix the issues above and push again!
+======================================
+                        """)
+                    } else {
+                        echo "PR Agent PASSED! Score ${score}/10 - Good to merge!"
+                    }
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                echo 'Build compiled successfully!'
+            }
+        }
+
+        stage('Deploy') {
+            when { branch 'master' }
+            steps {
+                echo 'Deploying...'
+            }
+        }
+    }
+
+    post {
+        success { echo "PIPELINE PASSED!" }
+        failure { echo "PIPELINE FAILED!" }
+    }
+}
