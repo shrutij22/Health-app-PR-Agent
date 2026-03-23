@@ -1,9 +1,9 @@
 pipeline {
-    agent { label 'jenkins_slave_180_214' }
+    agent { label 'your-jenkins-slave-label' }
 
     environment {
         SCORE_THRESHOLD = '6'
-        GROQ_API_KEY    = credentials('openai-api-key')
+        GROQ_API_KEY    = credentials('groq-api-key')
         BITBUCKET_TOKEN = credentials('bitbucket-token')
     }
 
@@ -37,7 +37,7 @@ pipeline {
                     def groqKey      = env.GROQ_API_KEY
                     def bitbucketTok = env.BITBUCKET_TOKEN
 
-                    def prUrl = "https://bitbucket.quickheal.com/bitbucket/projects/TRAIN/repos/shruti/pull-requests/${env.CHANGE_ID}"
+                    def prUrl = "https://your-bitbucket-server.com/bitbucket/projects/YOUR_PROJECT/repos/YOUR_REPO/pull-requests/${env.CHANGE_ID}"
 
                     echo "======================================"
                     echo "PR Agent Review for PR #${env.CHANGE_ID}"
@@ -53,7 +53,7 @@ pipeline {
                         script: """
                             export PATH=/root/.local/bin:\$PATH
                             export CONFIG__GIT_PROVIDER=bitbucket_server
-                            export BITBUCKET_SERVER__URL=https://bitbucket.quickheal.com/bitbucket
+                            export BITBUCKET_SERVER__URL=https://your-bitbucket-server.com/bitbucket
                             export BITBUCKET_SERVER__BEARER_TOKEN=${bitbucketTok}
                             export OPENAI__KEY=${groqKey}
                             export GROQ_API_KEY=${groqKey}
@@ -76,7 +76,7 @@ pipeline {
                     sh """
                         export PATH=/root/.local/bin:\$PATH
                         export CONFIG__GIT_PROVIDER=bitbucket_server
-                        export BITBUCKET_SERVER__URL=https://bitbucket.quickheal.com/bitbucket
+                        export BITBUCKET_SERVER__URL=https://your-bitbucket-server.com/bitbucket
                         export BITBUCKET_SERVER__BEARER_TOKEN=${bitbucketTok}
                         export OPENAI__KEY=${groqKey}
                         export GROQ_API_KEY=${groqKey}
@@ -108,7 +108,7 @@ PYEOF
                     def prComments = sh(
                         script: """
                             curl -s -H "Authorization: Bearer ${bitbucketTok}" \
-                            "https://bitbucket.quickheal.com/bitbucket/rest/api/1.0/projects/TRAIN/repos/shruti/pull-requests/${env.CHANGE_ID}/activities?limit=5" \
+                            "https://your-bitbucket-server.com/bitbucket/rest/api/1.0/projects/YOUR_PROJECT/repos/YOUR_REPO/pull-requests/${env.CHANGE_ID}/activities?limit=5" \
                             | python3.12 /tmp/get_comments.py
                         """,
                         returnStdout: true
